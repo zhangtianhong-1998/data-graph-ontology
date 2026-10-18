@@ -1,0 +1,310 @@
+"""Conservative column roles for semantic prompts and direct attribute bindings.
+
+Roles describe only the imported CSV snapshot and declared metadata.  In
+particular, an empty sample does not prove that the source database column is
+always empty, and a code or a non-PK ID may be a meaningful join key.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+
+_AUDIT_NAMES = {
+    "created_at", "created_time", "create_time", "create_date",
+    "creation_date", "creation_time", "updated_at", "updated_time",
+    "update_time", "update_date", "last_updated_at", "last_update_time",
+    "last_update_date", "modified_at", "modified_time", "modify_time",
+    "last_modified_at", "last_modified_time", "deleted_at", "delete_time",
+    "deleted_time", "inserted_at", "insert_time", "etl_time",
+    "load_time", "loaded_at", "ingest_time", "ingested_at", "sync_time",
+}
+_AUDIT_METADATA_NAMES = {
+    "delete_flag", "deleted_flag", "is_deleted", "created_by", "create_by",
+    "last_updated_by", "updated_by", "modified_by", "last_modified_by",
+}
+_BUSINESS_TIME_CUES = re.compile(
+    r"业务|交易|订单|合同|发生|生效|失效|统计|报告|结算|账期|预测|销售|"
+    r"business|transaction|order|contract|event|effective|report|settlement|"
+    r"accounting|forecast|sales|metric|measure|dimension",
+    re.IGNORECASE,
+)
+_SEMANTIC_NAME_CUES = re.compile(
+    r"(?:^|_)(?:name|alias|title|definition|description|meaning|formula|"
+    r"expression|expr|rule|scope|unit|label|category|type|value|date|"
+    r"time|period|code|id|metric|measure|dim|dimension|term)(?:_|$)"
+)
+_SEMANTIC_COMMENT_CUES = re.compile(
+    r"名称|别名|定义|含义|描述|公式|口径|规则|维度|指标|度量|范围|单位|"
+    r"编码|业务|区域|地区|来源|关联|指向|类型|取值|值域|周期|日期|时间"
+)
+_TECHNICAL_ID_NAMES = {"id", "pk", "pk_id", "row_id", "record_id", "uuid", "guid"}
+_SENSITIVE_NAME = re.compile(
+    r"(?:^|_)(?:password|passwd|pwd|secret|token|credential|api_key|access_key|"
+    r"private_key|client_secret|authorization|auth_header|connection_url|"
+    r"connection_string|dsn|account_name|email|phone|mobile|id_card)(?:_|$)", re.IGNORECASE,
+)
+_SENSITIVE_COMMENT = re.compile(r"密码|密钥|令牌|凭据|私钥|认证头|连接口令|身份证|手机号")
+
+# Context is retained as evidence, without becoming an applicability condition.
+# Identity qualifiers remain separate because removing a tenant or version can
+# merge equal labels that denote different definitions.
+CONTEXT_ROLES = frozenset(("provenance", "metadata", "identity"))
+_IDENTITY_CONTEXT = re.compile(
+    r"^(?:(?:tenant|namespace|version|revision)(?:_(?:id|code|name|number))?|"
+    r"(?:definition|schema|model|contract)_(?:version|revision))$", re.I)
+_PROVENANCE_CONTEXT = re.compile(
+    r"^(?:(?:data_)?source_(?:system|database|schema|code)|"
+    r"(?:origin|upstream|ingestion|ingest)_(?:system|source)|lineage)$", re.I)
+_METADATA_CONTEXT = re.compile(
+    r"^(?:language|lang|locale|(?:language|locale)_(?:code|name)|"
+    r"owner(?:_team|_name)?|steward(?:_team|_name)?|"
+    r"(?:sync|refresh)_(?:type|mode|method)|"
+    r"(?:record|definition|publication|lifecycle)_(?:status|state))$", re.I)
+
+
+def comment_is_echo(name: str, comment: str) -> bool:
+    """A comment that only repeats the column name is not a role declaration.
+
+    Real catalogs often copy the technical name into the comment or the Chinese
+    header. Those strings must not be read as a definition, alias or formula.
+    """
+    text = " ".join(str(comment or "").split())
+    if not text:
+        return True
+
+    def compact(value: str) -> str:
+        return re.sub(r"[\s_]+", "", value.casefold())
+
+    return compact(text) == compact(str(name or ""))
+
+
+def declared_context_role(column: dict[str, Any]) -> str | None:
+    """Separate explicit context from scope, without using value cardinality.
+
+    Opaque names may receive these roles through checked model proposals.
+    Generic status/type/source fields remain undecided because they can be
+    business coordinates or polymorphic references.
+    """
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(column.get("column_name") or "")).casefold()
+    comment = str(column.get("column_comment") or "")
+    if (_IDENTITY_CONTEXT.fullmatch(name)
+            or re.search(r"定义(?:版本|命名空间)|租户(?:标识|编码)|\b(?:definition version|tenant identifier|namespace)\b", comment, re.I)):
+        return "identity"
+    if (_PROVENANCE_CONTEXT.fullmatch(name)
+            or re.search(r"数据(?:来源|血缘)|来源系统|\b(?:source system|data provenance|data lineage)\b", comment, re.I)):
+        return "provenance"
+    if (_METADATA_CONTEXT.fullmatch(name)
+            or re.search(r"(?:词条|标签|显示|定义文本)(?:语言|语种)|负责人|负责团队|同步方式|同步类型|生命周期状态|\b(?:lexical language|display locale|record status)\b", comment, re.I)):
+        return "metadata"
+    return None
+
+
+def resolve_context_role(table: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
+    """Check context semantics independently of a model's rationale.
+
+    Source-value verification proves a quotation, not definition identity.
+    A source key remains a binding; an unsupported qualifier remains visible
+    as unknown content. Profiles only support a *candidate*, never key truth.
+    This also runs when consuming saved role candidates, so old responses
+    cannot bypass the boundary by carrying a previously verified status.
+    """
+    proposed = candidate.get("proposed_role", candidate.get("role"))
+    if proposed not in {*CONTEXT_ROLES, "scope"}:
+        return None
+    field = candidate.get("column")
+    column = next((item for item in table.get("columns", ())
+                   if item.get("column_name") == field), None)
+    if column is None:
+        return None
+    declared = declared_context_role(column)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", field).casefold()
+    profile = next((item for item in table.get("profiles", ())
+                    if item.get("column") == field), {})
+    samples = [str(value).strip() for value in profile.get("distinct_sample", ())
+               if value is not None and str(value).strip()]
+    # Observations have already been source-checked by the inference stage.
+    # Available profile values are a contradiction check against cherry-picking.
+    samples += [str(item.get("value", "")).strip()
+                for item in candidate.get("observations", ()) if str(item.get("value", "")).strip()]
+    effective, reason = proposed, None
+    if declared:
+        effective, reason = declared, "explicit_context_declaration"
+    elif proposed == "scope" and field in table.get("pk", ()):
+        # A model cannot evade the record-key boundary by renaming identity
+        # to scope. Non-PK dimension codes can legitimately delimit a scope.
+        effective, reason = "reference", "declared_record_primary_key_not_business_applicability"
+    elif proposed == "identity":
+        identifier_declaration = bool(re.search(
+            r"编号|编码|标识符|引用键|主键|外键|\b(?:identifier|primary key|foreign key|reference key)\b",
+            str(column.get("column_comment") or ""), re.I))
+        identifier_name = bool(re.search(r"(?:^|_)(?:id|code|key|uuid|guid|sn|no|number)$", normalized))
+        # Opaque columns can still carry explicit source-level qualifier text.
+        # Arbitrary A/B, numeric uniqueness or an LLM explanation is insufficient.
+        explicit_values = bool(samples) and all(re.fullmatch(
+            r"(?:tenant|namespace|definition[-_ ]version|definition[-_ ]revision|租户|命名空间|定义版本)"
+            r"\s*[:=/_-]\s*\S.*", value, re.I) for value in samples)
+        usable = profile.get("usable_count") or 0
+        near_unique = (usable >= 2 and profile.get("scan_scope") == "full_input"
+                       and ((profile.get("sample_exhaustive_in_input") and len(set(samples)) == usable)
+                            or (profile.get("approx_distinct_usable", profile.get("approx_distinct")) or 0)
+                            >= 0.9 * usable))
+        code_values = bool(samples) and all(re.fullmatch(
+            r"(?:[+-]?\d+|(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9][A-Za-z0-9_-]+)", value)
+            for value in samples)
+        if field in table.get("pk", ()) or identifier_declaration or identifier_name:
+            effective, reason = "reference", "source_record_or_reference_key_not_definition_qualifier"
+        elif explicit_values and profile.get("scan_scope") == "full_input":
+            effective, reason = "identity", "explicit_qualifier_values_with_profile_support"
+        elif near_unique and code_values:
+            effective, reason = "reference", "profile_supported_record_key_candidate_not_definition_identity"
+        else:
+            effective, reason = "unknown", "definition_identity_lacks_independent_source_support"
+    elif proposed in {"metadata", "provenance"}:
+        # Nonempty structured content can contain lexical meaning, references,
+        # constraints or formulas. Do not discard its semantics as generic admin
+        # metadata, or invent a description from the model's explanation.
+        structured = False
+        for value in samples:
+            try:
+                parsed = json.loads(value)
+            except (ValueError, TypeError):
+                continue
+            structured |= isinstance(parsed, (dict, list)) and bool(parsed)
+        if structured:
+            effective, reason = "unknown", "structured_content_requires_semantic_review"
+        elif proposed == "metadata" and samples and all(re.fullmatch(
+                r"(?:zh|en|de|fr|ja|ko|es|it|pt|ru|ar)(?:[-_](?:[A-Za-z]{2}|[A-Za-z]{4})(?:[-_][A-Za-z]{2})?)?",
+                value, re.I) for value in samples) and profile.get("scan_scope") == "full_input":
+            effective, reason = "metadata", "lexical_locale_values_with_profile_support"
+        elif proposed == "provenance" and samples and all(re.fullmatch(
+                r"(?:source|system|instrument|registry|upstream|来源系统|数据来源)\s*[:=/_-]\s*\S.*",
+                value, re.I) for value in samples) and profile.get("scan_scope") == "full_input":
+            effective, reason = "provenance", "explicit_source_values_with_profile_support"
+        else:
+            # Unknown scalar flags can distinguish actual/budget values, rule
+            # modes or lexical categories. A model's admin label alone must
+            # not erase them from complete template compatibility checks.
+            effective, reason = "unknown", "context_role_lacks_independent_source_support"
+    if reason is None:
+        return None
+    return {"column": field, "proposed_role": proposed, "effective_role": effective,
+            "reason": reason, "resolution_origin": "independent_source_role_evidence",
+            "binding_only": effective == "reference", "semantic_identity_claim": False,
+            "schema_evidence_id": f"schema:{_table_name(table)}:{field}",
+            "profile_field_id": profile.get("field_id"),
+            "validation_scope": "source_declaration_and_available_profile_values",
+            "semantic_status": "candidate_not_semantic_truth"}
+
+
+def is_sensitive_column(column: dict[str, Any]) -> bool:
+    """Conservative value-redaction boundary for common credential fields."""
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(column.get("column_name") or ""))
+    comment = str(column.get("column_comment") or "")
+    return bool(_SENSITIVE_NAME.search(name) or _SENSITIVE_COMMENT.search(comment))
+
+
+def _table_name(table: dict[str, Any]) -> str:
+    if table.get("name"):
+        return str(table["name"])
+    if table.get("schema") and table.get("table_name"):
+        return f"{table['schema']}.{table['table_name']}"
+    return str(table.get("table_name", "unknown_table"))
+
+
+def _empty_in_input(profile: dict[str, Any] | None) -> bool:
+    if not profile or profile.get("scan_scope") != "full_input":
+        return False
+    rows, usable = profile.get("row_count"), profile.get("usable_count")
+    stat = profile.get("statistics", {}).get("usable_count", {})
+    return (
+        isinstance(rows, int) and not isinstance(rows, bool) and rows > 0
+        and usable == 0 and stat.get("value") == 0
+        and stat.get("exact") is True and stat.get("status") == "complete"
+        and stat.get("rows_scanned") == rows
+    )
+
+
+def _literal_type(data_type: str) -> str:
+    sql_type = data_type.lower().strip()
+    if "timestamp" in sql_type or sql_type.startswith("datetime"):
+        return "datetime"
+    if sql_type == "date":
+        return "date"
+    if sql_type in ("bool", "boolean"):
+        return "boolean"
+    if re.match(r"^(smallint|integer|bigint|int\d*|serial\d*)$", sql_type):
+        return "integer"
+    if re.match(r"^(numeric|decimal|real|double|float)", sql_type):
+        return "decimal"
+    return "string"
+
+
+def classify_columns(table: dict[str, Any]) -> list[dict[str, Any]]:
+    """Classify each declared column without dropping it from source mappings.
+
+    ``include_in_semantic_prompt=False`` applies only to prompt construction;
+    every field remains in the deterministic direct mapping.  A binding is
+    provided for columns whose meaning is settled by schema/profile evidence.
+    Unknown and semantic columns stay visible so uncertain business fields are
+    never silently discarded.
+    """
+    table_name = _table_name(table)
+    pk = set(table.get("pk") or ())
+    excluded = set(table.get("semantic_excluded_columns") or ())
+    profiles = {p["column"]: p for p in table.get("profiles", ()) if p.get("column")}
+    result = []
+    for column in table.get("columns", ()):
+        name = str(column["column_name"])
+        normalized = name.lower()
+        comment = str(column.get("column_comment") or "")
+        informative_comment = "" if comment_is_echo(name, comment) else comment
+        profile = profiles.get(name)
+        join_eligible = normalized in {"uuid", "guid", "pk"} or bool(
+            re.search(r"(?:^|_)(?:id|code|key)$", normalized)
+        )
+
+        if name in excluded or is_sensitive_column(column):
+            role, reason = "sensitive", "excluded from semantic processing by configuration or credential-like name"
+            join_eligible = False
+        elif _empty_in_input(profile):
+            role, reason = "empty", "no usable values in the full imported CSV snapshot"
+        elif normalized in _AUDIT_NAMES and not _BUSINESS_TIME_CUES.search(informative_comment):
+            role, reason = "audit_time", "explicit audit timestamp name without business-time evidence"
+        elif normalized in _AUDIT_METADATA_NAMES and not _BUSINESS_TIME_CUES.search(informative_comment):
+            role, reason = "audit_metadata", "explicit audit metadata name without business-context evidence"
+        elif (name in pk and (normalized in _TECHNICAL_ID_NAMES or normalized.endswith("_id"))
+              and not _BUSINESS_TIME_CUES.search(informative_comment)):
+            role, reason = "technical_identifier", "declared primary key with a technical ID name"
+        elif (_SEMANTIC_NAME_CUES.search(normalized) or _SEMANTIC_COMMENT_CUES.search(name)
+              or _SEMANTIC_COMMENT_CUES.search(informative_comment) or join_eligible):
+            role, reason = "semantic", "name or comment indicates business meaning or a reference key"
+        else:
+            role, reason = "unknown", "insufficient evidence to remove from semantic analysis"
+
+        deterministic = role in ("empty", "audit_time", "audit_metadata", "technical_identifier", "sensitive")
+        result.append({
+            "column": name,
+            "role": role,
+            "reason": reason,
+            "include_in_semantic_prompt": not deterministic,
+            "deterministic_binding": ({
+                "relation_type": "has",
+                "source_table": table_name,
+                "source_column": name,
+                "declared_data_type": column.get("data_type"),
+                "literal_type": _literal_type(str(column.get("data_type") or "")),
+            } if deterministic else None),
+            "join_eligible": join_eligible,
+            "evidence": {
+                "schema_id": f"schema:{table_name}:{name}",
+                "profile_field_id": profile.get("field_id") if profile else None,
+                "row_count": profile.get("row_count") if profile else None,
+                "usable_count": profile.get("usable_count") if profile else None,
+                "scan_scope": profile.get("scan_scope") if profile else None,
+                "input_scope": profile.get("input_scope") if profile else None,
+            },
+        })
+    return result

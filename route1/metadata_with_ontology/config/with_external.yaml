@@ -1,0 +1,37 @@
+config_version: "0.1"
+route: route1
+profile: E1B
+model_profile: ../ontologies/internal_model.yaml
+input:
+  root: "${DATASET_DIR}"
+  metadata_dir: schema
+  read_csv: false
+  scope: sample
+seed: {load_previous_core: false}
+llm:
+  stream: false
+  thinking:
+    mode: disabled
+    parameter: chat_template_kwargs
+    effort: medium
+  model: "${ONTOLOGY_LLM_MODEL}"
+  base_url: "${ONTOLOGY_LLM_BASE_URL}"
+  api_key_env: ONTOLOGY_LLM_API_KEY
+  temperature: 0
+  max_repairs: 2
+  timeout_seconds: 60
+  max_calls: 300
+  max_total_tokens: 600000
+external_ontology:
+  enabled: true
+  allow_network_imports: false
+  top_k: 5
+  sources:
+    - id: gist
+      format: rdf
+      path: "../ontologies/gist/ontologies/gistCore.ttl"
+      version: "c73068bfe779db2643b1e43c920cc8039b15a013"
+      sha256: "0d8230f3a4df9aa7782ec79bfa83def34a13a066f60d5f5ef0f00b9cecce08b1"
+# 默认只试一个模型；其他模型通过同一 sources 列表配置，见 docs/shared/sources.md。
+enterprise_rag: {enabled: false}
+output: {root: ../runs, shard_size: 5000}

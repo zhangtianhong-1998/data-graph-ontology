@@ -1,0 +1,212 @@
+"""Reject invented roots, nonexistent source fields and evidence-free plans."""
+from .models import BuildPlan
+from .relation_contract import canonical_relation_id, canonical_relation_label
+
+
+def validate_plan(plan: BuildPlan, data, profile):
+    errors = []
+    types = {t["id"]: None for t in profile["object_roots"]}
+    relations = {r["id"]: r["kind"] for r in profile["relation_roots"]}
+    if ({t.id for t in plan.object_types} | set(types)) & ({r.id for r in plan.relation_types} | set(relations)):
+        errors.append("object and relation types cannot share an id")
+    for items, known in ((plan.object_types, types), (plan.relation_types, relations)):
+        pending = {t.id: t for t in items}
+        if len(pending) != len(items):
+            errors.append("duplicate derived type id")
+        while pending:
+            progress = False
+            for name, t in list(pending.items()):
+                if name in known:
+                    errors.append("cannot replace root/type: " + name)
+                    del pending[name]
+                    progress = True
+                elif t.parent in known:
+                    if not t.evidence_ids or not set(t.evidence_ids) <= data.evidence.keys():
+                        errors.append("derived type lacks source evidence: " + name)
+                    known[name] = known[t.parent]
+                    del pending[name]
+                    progress = True
+            if not progress:
+                errors.append("unknown/cyclic parent: " + ",".join(pending))
+                break
+    object_parents = {item.id: item.parent for item in plan.object_types}
+    for item in plan.object_types:
+        if item.domain or item.range or item.endpoint_basis:
+            errors.append("object type cannot have relation endpoints: " + item.id)
+    for item in plan.relation_types:
+        if bool(item.domain) != bool(item.range):
+            errors.append("relation domain and range must be declared together: " + item.id)
+        if item.endpoint_basis and not (item.domain and item.range):
+            errors.append("relation endpoint basis lacks a signature: " + item.id)
+        if not set(item.domain + item.range) <= set(types):
+            errors.append("relation domain/range names an unknown object type: " + item.id)
+        if item.category == "business_relation_type":
+            from .relation_contract import predicate_endpoint_errors
+            errors.extend(reason + ": " + item.id for reason in
+                          predicate_endpoint_errors(item, plan.object_types))
+            business_ids = {t.id for t in plan.object_types if t.category == "business_type"}
+            valid_basis = (
+                (item.endpoint_basis == "record_alignment"
+                 and item.evidence_scope in ("one_positive_pair_with_exact_type_alignments",
+                                             "one_positive_pair_with_type_bindings"))
+                or (item.endpoint_basis == "configuration_reference"
+                    and item.evidence_scope in ("one_configuration_witness_with_exact_type_alignments",
+                                                "one_configuration_witness_with_type_bindings"))
+                or (item.endpoint_basis == "calculation_binding"
+                    and item.evidence_scope == "complete_calculation_definition"
+                    and item.parent == "depends_on"
+                    and item.predicate_name == "calculation_dependency")
+                or (item.endpoint_basis == "semantic_binding"
+                    and item.evidence_scope == "checked_structured_binding")
+                or (item.endpoint_basis == "semantic_reference"
+                    and item.evidence_scope == "verified_lexical_member_path")
+                or (item.endpoint_basis == "structural_coverage"
+                    and item.evidence_scope == "source_schema")
+            )
+            if (not item.domain or not item.range
+                    or not set(item.domain + item.range) <= business_ids
+                    or not valid_basis):
+                errors.append("business relation requires accepted business type endpoints: " + item.id)
+            if len(item.domain) != 1 or len(item.range) != 1:
+                errors.append("business relation requires one directed endpoint type per side: " + item.id)
+            else:
+                try:
+                    expected_id = canonical_relation_id(item.parent, item.domain[0], item.range[0],
+                                                        predicate_name=item.predicate_name,
+                                                        semantic_parameters=item.semantic_parameters)
+                    expected_label = canonical_relation_label(item.parent, item.predicate_name)
+                except ValueError:
+                    errors.append("business relation requires a supported object root: " + item.id)
+                else:
+                    if item.id != expected_id or item.label != expected_label:
+                        errors.append("business relation requires canonical predicate name and ID: " + item.id)
+            if any(relation.predicate == item.id for relation in plan.relations):
+                errors.append("one-pair business relation cannot execute as a table plan: " + item.id)
+            if item.endpoint_basis == "calculation_binding":
+                from .calculation_contracts import calculation_relation_errors
+                errors.extend(reason + ": " + item.id for reason in
+                              calculation_relation_errors(data, item, plan.object_types))
+            if item.endpoint_basis == "semantic_binding":
+                from .semantic_bindings import binding_relation_errors
+                errors.extend(reason + ": " + item.id for reason in
+                              binding_relation_errors(data, item, plan.object_types))
+            if item.endpoint_basis == "semantic_reference":
+                from .semantic_references import verify_semantic_reference_relation
+                try:
+                    verify_semantic_reference_relation(data, item, plan)
+                except (ValueError, KeyError) as exc:
+                    errors.append("semantic reference proof failed: " + str(exc) + ": " + item.id)
+        if item.endpoint_basis == "table_binding":
+            bindings = [relation for relation in plan.relations if relation.predicate == item.id]
+            if len(item.domain) != 1 or len(item.range) != 1 or not bindings:
+                errors.append("source-record relation requires a directed plan and endpoint signature: " + item.id)
+            else:
+                try:
+                    expected_label = canonical_relation_label(item.parent, item.predicate_name)
+                    expected_ids = {
+                        canonical_relation_id(
+                            item.parent, item.domain[0], item.range[0],
+                            namespace="relation", predicate_name=item.predicate_name,
+                            semantic_parameters=item.semantic_parameters, qualifier=[
+                                binding.source_table, binding.source_column,
+                                binding.target_table, binding.target_column])
+                        for binding in bindings
+                    }
+                except ValueError:
+                    errors.append("source-record relation requires a supported object root and complete signature: " + item.id)
+                else:
+                    if expected_ids != {item.id} or item.label != expected_label:
+                        errors.append("source-record relation requires canonical predicate name and ID: " + item.id)
+
+    def is_subtype(actual, declared):
+        seen = set()
+        while actual and actual not in seen:
+            if actual == declared:
+                return True
+            seen.add(actual)
+            actual = object_parents.get(actual)
+        return False
+
+    # A derived predicate may narrow inherited endpoint types, never widen them.
+    relation_by_id = {item.id: item for item in plan.relation_types}
+    for relation in plan.relation_types:
+        parent = relation_by_id.get(relation.parent)
+        if parent and profile.get("derivation_policy", {}).get("allow_domain_range_widening") is False:
+            for side in ("domain", "range"):
+                inherited, actual = getattr(parent, side), getattr(relation, side)
+                if inherited and (not actual or any(not any(is_subtype(value, base)
+                        for base in inherited) for value in actual)):
+                    errors.append("relation widens inherited " + side + ": " + relation.id)
+
+    table_plans = {t.table: t for t in plan.tables}
+    if len(table_plans) != len(plan.tables):
+        errors.append("duplicate table plan")
+    for p in plan.tables:
+        if p.table not in data.tables:
+            errors.append("unknown table: " + p.table)
+            continue
+        columns = set(data.tables[p.table]["column_names"])
+        required = set(p.identity_columns) | set(p.attributes.values()) | ({p.label_column} if p.label_column else set())
+        if not required <= columns or p.object_type not in types:
+            errors.append("unknown field/type: " + p.table)
+        if not p.evidence_ids or not set(p.evidence_ids) <= data.evidence.keys():
+            errors.append("missing table evidence: " + p.table)
+    if len({r.id for r in plan.relations}) != len(plan.relations):
+        errors.append("duplicate relation plan id")
+    def condition_columns(c):
+        return ({c.field} if c.field else set()) | set().union(*(condition_columns(x) for x in c.children))
+    for p in plan.relations:
+        if p.source_table not in table_plans or p.target_table not in table_plans:
+            errors.append("relation endpoints lack a table plan: " + p.id)
+            continue
+        if p.source_table not in data.tables or p.target_table not in data.tables:
+            continue
+        if (p.witnessed_pairs or p.witness_snapshot_id) and p.witness_snapshot_id != data.snapshot_id:
+            errors.append("relation witness snapshot differs from input: " + p.id)
+        if p.evidence_scope == "sample_semantic_with_full_technical_check" and not p.witnessed_pairs:
+            errors.append("sample-supported relation requires witnessed record pair: " + p.id)
+        if p.witnessed_pairs and p.mode != "identifier":
+            errors.append("witnessed relation currently requires identifier mode: " + p.id)
+        pairs = [(item.source_record_id, item.target_record_id) for item in p.witnessed_pairs]
+        if len(pairs) != len(set(pairs)):
+            errors.append("duplicate witnessed relation pair: " + p.id)
+        source, target = data.tables[p.source_table], data.tables[p.target_table]
+        if p.target_column in p.scope_bindings.values() or len(set(p.scope_bindings.values())) != len(p.scope_bindings):
+            errors.append("conflicting target field bindings: " + p.id)
+        cols = {p.source_column} | set(p.scope_bindings) | set(p.context_columns)
+        if p.selector:
+            cols |= condition_columns(p.selector)
+        if not cols <= set(source["column_names"]) or not ({p.target_column} | set(p.scope_bindings.values())) <= set(target["column_names"]):
+            errors.append("unknown relation fields: " + p.id)
+        if relations.get(p.predicate) != "object":
+            errors.append("object relation required: " + p.id)
+        relation_type = next((item for item in plan.relation_types
+                              if item.id == p.predicate), None)
+        if relation_type and relation_type.domain and relation_type.range:
+            source_type = table_plans[p.source_table].object_type
+            target_type = table_plans[p.target_table].object_type
+            if not any(is_subtype(source_type, domain) for domain in relation_type.domain):
+                errors.append("relation source type violates domain: " + p.id)
+            if not any(is_subtype(target_type, range_type) for range_type in relation_type.range):
+                errors.append("relation target type violates range: " + p.id)
+        if p.evidence_scope and (relation_type is None
+                                 or relation_type.evidence_scope != p.evidence_scope):
+            errors.append("relation evidence scope differs from predicate: " + p.id)
+        relevant = {f"schema:{p.source_table}", f"schema:{p.source_table}:{p.source_column}"}
+        if not p.evidence_ids or not set(p.evidence_ids) <= data.evidence.keys() or not relevant.intersection(p.evidence_ids):
+            errors.append("source reference-role evidence required: " + p.id)
+        elif not any(data.evidence[e]["raw_fragment"].strip() for e in relevant.intersection(p.evidence_ids)) \
+                and not any(_structural_reference(data.evidence[e], p) for e in p.evidence_ids):
+            errors.append("empty reference-role evidence: " + p.id)
+        if p.semantics in ("allowed_member", "observed_member") and p.mode != "members":
+            errors.append("member semantics requires members extractor: " + p.id)
+    return errors
+
+
+def _structural_reference(evidence, plan):
+    """A full-input key check stands in for an empty column comment."""
+    ref = evidence.get("source_ref") or {}
+    return (evidence.get("origin") == "structural_key_reference"
+            and ref.get("table") == plan.source_table and ref.get("column") == plan.source_column
+            and ref.get("target_table") == plan.target_table
+            and ref.get("target_column") == plan.target_column)

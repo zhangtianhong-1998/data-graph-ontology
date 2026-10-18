@@ -1,0 +1,649 @@
+"""Conservative semantic adjudication of two-ended configuration references.
+
+Code equality can identify two accepted definition records. It does not name
+their business relation. This stage needs an explicit, directional phrase in
+the configuration row plus complete definition quotes from both endpoints.
+The configuration record stays a witness, never an object endpoint.
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections import defaultdict, deque
+from typing import Literal
+
+from pydantic import Field, field_validator
+
+from .configuration_relations import _check_column, _type_alignments, verify_configuration_pair
+from .models import BuildPlan, DerivedType, Strict, json_null_placeholder
+from .relation_contract import (canonical_relation_id, canonical_relation_label,
+                                relation_semantic_parameters,
+                                relation_scope_conflicts,
+                                validate_calculation_parameter_evidence,
+                                validate_proposed_relation_label)
+from .storage import digest, qi, record_evidence_id
+from .validation import validate_plan
+
+
+_CUES = {
+    "contains": ("包含", "含有", "contains"),
+    "depends_on": ("依赖", "取决于", "depends on"),
+    "related_to": ("关联", "相关于", "related to"),
+    "points_to": ("指向", "引用", "points to", "references"),
+}
+
+
+class ConfigurationRelationDecision(Strict):
+    status: Literal["proposed", "no_change", "unresolved"]
+    direction: Literal["source_to_target", "target_to_source"] | None = None
+    parent_relation: Literal["contains", "depends_on", "related_to", "points_to"] | None = None
+    predicate_name: str | None = None
+    semantic_parameters: dict[str, str] = Field(default_factory=dict)
+    assertion_status: Literal["affirmed", "negated", "conditional", "inactive", "uncertain"] = "affirmed"
+    qualifier_quote: str = ""
+    label: str = ""
+    definition: str = ""
+    configuration_quote: str = ""
+    source_definition_quote: str = ""
+    target_definition_quote: str = ""
+    reason: str = ""
+
+    @field_validator("direction", "parent_relation", "predicate_name", mode="before")
+    @classmethod
+    def parse_nullable_tool_fields(cls, value):
+        return json_null_placeholder(value)
+
+
+def _norm(value):
+    return unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+
+
+def _fragment_for_exact_record(data, business_type, record_id, quote, binding_evidence=()):
+    if not quote or not quote.strip():
+        raise ValueError("Endpoint decision lacks a full-definition quote")
+    for fragment in _definition_previews(data, business_type, record_id, binding_evidence):
+        if quote.strip() == fragment["quote"].strip():
+            return fragment["evidence_id"]
+    raise ValueError("Endpoint quote is absent from its exact complete definition record")
+
+
+def _explicit_direction(quote, first_anchors, second_anchors, relation, direction,
+                        predicate_name=None):
+    """Accept a complete positive sentence; unmatched modifiers stay unresolved.
+
+    Substring endpoint ordering loses negation and conditions. Until condition
+    compilation exists, accepting only a full supported clause is deliberate.
+    """
+    compact = lambda value: re.sub(r"\s+", "", _norm(value)).rstrip("。.!！")
+    phrase = compact(quote)
+    name = canonical_relation_label(relation, predicate_name)
+    from .relation_contract import _DERIVED_CUES
+    cues = _DERIVED_CUES[name] if name != relation else _CUES[relation]
+    pairs = ((first_anchors, second_anchors) if direction == "source_to_target"
+             else (second_anchors, first_anchors))
+    allowed = {compact(first) + compact(cue) + compact(second)
+               for first in pairs[0] for second in pairs[1] for cue in cues
+               if first and second and len(compact(first)) >= 2 and len(compact(second)) >= 2}
+    return phrase in allowed
+
+
+def _read_witness(data, candidate):
+    table_name = candidate.get("configuration_table")
+    table = data.tables.get(table_name)
+    row_number = candidate.get("configuration_witness_row_number")
+    if table is None or type(row_number) is not int or row_number < 1:
+        raise ValueError("Configuration witness table or row is invalid")
+    cursor = data.db.execute(
+        f"SELECT * FROM {qi(table['sql_name'])} WHERE __r2_row=?", [row_number])
+    names = [item[0] for item in cursor.description]
+    raw = cursor.fetchone()
+    if raw is None:
+        raise ValueError("Configuration witness row is absent")
+    row = dict(zip(names, raw))
+    if data.record_id(table_name, row) != candidate.get("configuration_record_id"):
+        raise ValueError("Configuration witness record identity differs from the snapshot")
+    for side in ("source", "target"):
+        column = candidate.get(side + "_code_column")
+        if column not in table["column_names"] or row[column] != candidate.get(side + "_code"):
+            raise ValueError("Configuration witness code differs from its candidate")
+        _check_column(data, table_name, column)
+    return row
+
+
+def _endpoint(data, plan, candidate, side, aligned):
+    stated = candidate.get(side + "_definition") or {}
+    table_name, code_column = stated.get("table"), stated.get("code_column")
+    code = candidate.get(side + "_code")
+    if (table_name not in data.tables or code_column not in data.tables[table_name]["column_names"]
+            or code in (None, "")):
+        raise ValueError("Definition endpoint lacks a valid code binding")
+    _check_column(data, table_name, code_column)
+    rows = data.lookup(table_name, ((code_column, code), *sorted(stated.get("lookup_scope", {}).items())))
+    if len(rows) != 1:
+        raise ValueError("Definition code is missing or ambiguous in the full snapshot")
+    record_id = data.record_id(table_name, rows[0])
+    matched = aligned.get(record_id)
+    type_id = candidate.get(side + "_type_id")
+    if (record_id != stated.get("record_id") or matched is None
+            or matched["type_id"] != type_id
+            or matched.get("snapshot_id") not in (None, data.snapshot_id)
+            or matched["concept_id"] != stated.get("concept_id")):
+        raise ValueError("Definition row lacks the cited current accepted business type binding")
+    business_type = next((item for item in plan.object_types
+                          if item.id == type_id and item.category == "business_type"), None)
+    if business_type is None:
+        raise ValueError("Configuration endpoint is not an accepted business type")
+    # The accepted mapping owns this row; the type owns the admissible
+    # definition columns. Read those cells together, even when the type was
+    # originally induced from a different template witness.
+    proofs = set(matched.get("evidence_ids", []))
+    for prop in business_type.source_properties:
+        if prop.role not in ("description", "formula") or prop.source_table != table_name:
+            continue
+        _check_column(data, table_name, prop.source_column)
+        value = rows[0].get(prop.source_column)
+        if not isinstance(value, str) or not value.strip() or len(value) > 1024:
+            continue
+        eid = record_evidence_id(record_id, prop.source_column)
+        existing = data.evidence.get(eid)
+        if existing and (existing.get("raw_fragment") != value or existing.get("raw_fragment_truncated")
+                         or existing.get("source_ref", {}).get("snapshot_id") != data.snapshot_id):
+            raise ValueError("Current endpoint definition evidence differs from its complete snapshot record")
+        data.evidence[eid] = {"id": eid, "origin": "observed_record", "raw_fragment": value,
+            "raw_fragment_truncated": False, "source_ref": {"snapshot_id": data.snapshot_id,
+                "table": table_name, "column": prop.source_column, "record_id": record_id,
+                "row": rows[0]["__r2_row"]}}
+        proofs.add(eid)
+    matched = {**matched, "evidence_ids": sorted(proofs)}
+    return business_type, matched, record_id
+
+
+def compile_configuration_relation(data, profile, core: BuildPlan, candidate,
+                                   decision: ConfigurationRelationDecision,
+                                   concepts, alignments, *, memberships=()):
+    """Atomically add one business relation and one witnessed concept assertion."""
+    decision = ConfigurationRelationDecision.model_validate(decision)
+    if decision.status != "proposed":
+        return None
+    if candidate.get("status") != "endpoint_verified_candidate":
+        raise ValueError("Only endpoint-verified configuration candidates can be compiled")
+    if candidate.get("snapshot_id") != data.snapshot_id:
+        raise ValueError("Configuration candidate snapshot differs from the input")
+    if candidate.get("predicate_status") != "unjudged":
+        raise ValueError("Configuration candidate predicate status is not unjudged")
+    if (decision.direction not in ("source_to_target", "target_to_source")
+            or decision.parent_relation not in _CUES
+            or not decision.label.strip() or not decision.definition.strip()):
+        raise ValueError("Configuration relation lacks direction, root, label or definition")
+    relation_roots = {item["id"] for item in profile["relation_roots"]
+                      if item.get("kind") == "object"}
+    if decision.parent_relation not in relation_roots:
+        raise ValueError("Configuration relation root is not in the profile")
+    core = BuildPlan.model_validate(core)
+    if candidate.get("auxiliary_path_proof"):
+        from .auxiliary_relation_paths import replay_auxiliary_path
+        replay_auxiliary_path(data, candidate, plan=core)
+    aligned, conflicting = _type_alignments(core, concepts, alignments, memberships)
+    source_type, source_match, source_record = _endpoint(data, core, candidate, "source", aligned)
+    target_type, target_match, target_record = _endpoint(data, core, candidate, "target", aligned)
+    if source_record in conflicting or target_record in conflicting:
+        raise ValueError("An endpoint has conflicting exact type alignments")
+    source_definition_evidence = _fragment_for_exact_record(
+        data, source_type, source_record, decision.source_definition_quote, source_match["evidence_ids"])
+    target_definition_evidence = _fragment_for_exact_record(
+        data, target_type, target_record, decision.target_definition_quote, target_match["evidence_ids"])
+    if relation_scope_conflicts(source_type, target_type, data):
+        raise ValueError("Configuration endpoints have conflicting applicability scopes")
+
+    witness = _read_witness(data, candidate)
+    verify_configuration_pair(data, core, candidate, witness)
+    text_column = candidate.get("relation_text_column")
+    if not text_column or text_column not in data.tables[candidate["configuration_table"]]["column_names"]:
+        raise ValueError("Configuration row has no explicit relationship text")
+    _check_column(data, candidate["configuration_table"], text_column)
+    literal = witness.get(text_column)
+    if (not isinstance(literal, str) or not literal.strip()
+            or len(literal) > 1024 or literal != candidate.get("predicate_literal")
+            or not decision.configuration_quote.strip()
+            or decision.configuration_quote not in literal):
+        raise ValueError("Configuration relationship text is absent, changed or over budget")
+    if decision.assertion_status != "affirmed" or decision.qualifier_quote:
+        raise ValueError("Configuration negation, condition or inactive status requires an explicit supported constraint")
+    if _norm(decision.configuration_quote) != _norm(literal):
+        raise ValueError("Configuration quote must preserve the entire statement and its qualifiers")
+    if not _explicit_direction(
+        literal,
+        (source_type.label, candidate.get("source_code")),
+        (target_type.label, candidate.get("target_code")),
+        decision.parent_relation, decision.direction, decision.predicate_name,
+    ):
+        raise ValueError("Configuration text does not prove the proposed predicate and direction")
+    config_evidence = record_evidence_id(candidate["configuration_record_id"], text_column)
+    saved = data.evidence.get(config_evidence) or {}
+    if (saved.get("origin") != "observed_record"
+            or saved.get("raw_fragment_truncated")
+            or saved.get("raw_fragment") != literal
+            or saved.get("source_ref", {}).get("record_id") != candidate["configuration_record_id"]):
+        raise ValueError("Configuration phrase lacks complete witness evidence")
+
+    ordered = ((source_type, target_type, source_match, target_match,
+                source_record, target_record)
+               if decision.direction == "source_to_target" else
+               (target_type, source_type, target_match, source_match,
+                target_record, source_record))
+    subject_type, object_type, subject_match, object_match, subject_record, object_record = ordered
+    validate_proposed_relation_label(
+        decision.label, decision.parent_relation,
+        subject_label=subject_type.label, object_label=object_type.label,
+        predicate_name=decision.predicate_name)
+    semantic_parameters = relation_semantic_parameters(
+        decision.parent_relation, decision.predicate_name, decision.semantic_parameters)
+    if semantic_parameters:
+        formulas = [data.evidence[evidence_id]["raw_fragment"]
+                    for prop in subject_type.source_properties if prop.role == "formula"
+                    for evidence_id in prop.evidence_ids if evidence_id in data.evidence
+                    and not data.evidence[evidence_id].get("raw_fragment_truncated")]
+        validate_calculation_parameter_evidence(semantic_parameters, formulas,
+                                                [object_type.label])
+    evidence_ids = sorted(set(candidate.get("evidence_ids", [])
+                              + [config_evidence, source_definition_evidence,
+                                 target_definition_evidence]
+                              + source_match["evidence_ids"] + target_match["evidence_ids"]))
+    if not set(evidence_ids) <= data.evidence.keys():
+        raise ValueError("Configuration relation evidence is missing")
+    relation_id = canonical_relation_id(
+        decision.parent_relation, subject_type.id, object_type.id,
+        predicate_name=decision.predicate_name, semantic_parameters=semantic_parameters)
+    both_exact = all(item.get("mapping_kind") == "exact" for item in (source_match, target_match))
+    scope = ("one_configuration_witness_with_exact_type_alignments" if both_exact
+             else "one_configuration_witness_with_type_bindings")
+    relation_type = DerivedType(
+        id=relation_id, parent=decision.parent_relation,
+        label=canonical_relation_label(decision.parent_relation, decision.predicate_name),
+        predicate_name=decision.predicate_name, semantic_parameters=semantic_parameters,
+        definition=decision.definition.strip(),
+        category="business_relation_type", domain=[subject_type.id],
+        range=[object_type.id], endpoint_basis="configuration_reference",
+        evidence_scope=scope,
+        evidence_ids=evidence_ids,
+    )
+    proposed = core.model_copy(deep=True)
+    existing = next((item for item in proposed.relation_types if item.id == relation_id), None)
+    if existing:
+        if (existing.parent != relation_type.parent or existing.label != relation_type.label
+                or existing.definition != relation_type.definition
+                or existing.domain != relation_type.domain or existing.range != relation_type.range
+                or existing.endpoint_basis != relation_type.endpoint_basis
+                or existing.evidence_scope != relation_type.evidence_scope):
+            raise ValueError("Configuration relation conflicts with an existing type")
+        proposed.relation_types[proposed.relation_types.index(existing)] = existing.model_copy(update={
+            "evidence_ids": sorted(set(existing.evidence_ids) | set(evidence_ids))})
+    else:
+        proposed.relation_types.append(relation_type)
+    errors = validate_plan(proposed, data, profile)
+    if errors:
+        raise ValueError("Configuration relation plan invalid: " + "; ".join(errors))
+    subject_id = subject_match.get("concept_id") if both_exact else subject_record
+    object_id = object_match.get("concept_id") if both_exact else object_record
+    assertion = {
+        "id": "concept_relation:" + digest([
+            data.snapshot_id, relation_id, subject_id,
+            object_id, candidate["configuration_record_id"]])[:24],
+        "subject": subject_id, "predicate": relation_id,
+        "object": object_id,
+        "subject_type": subject_type.id, "object_type": object_type.id,
+        "source_record_pair": {"source": subject_record, "target": object_record},
+        "configuration_witness_record_id": candidate["configuration_record_id"],
+        "configuration_candidate_id": candidate["id"],
+        "auxiliary_path_proof_id": (candidate.get("auxiliary_path_proof") or {}).get("id"),
+        "configuration_text": literal, "assertion_status": "affirmed",
+        "configuration_decision": decision.model_dump(),
+        "endpoint_scope": "exact_definition_pair" if both_exact else "typed_record_witness",
+        "endpoint_mapping_kinds": {"source": subject_match.get("mapping_kind"),
+                                   "target": object_match.get("mapping_kind")},
+        "scope": {key: value for key, value in
+                  {**object_type.applicability_scope, **subject_type.applicability_scope}.items()
+                  if (key not in object_type.applicability_scope or key not in subject_type.applicability_scope
+                      or object_type.applicability_scope[key] == subject_type.applicability_scope[key])},
+        "endpoint_scopes": {"source": dict(subject_type.applicability_scope),
+                            "target": dict(object_type.applicability_scope)},
+        "identity_scope": "input_snapshot", "evidence_ids": evidence_ids,
+        "decision": {"status": "accepted", "method": ("explicit_configuration_phrase_and_exact_type_alignments"
+                     if both_exact else "explicit_configuration_phrase_and_type_bindings"),
+                     "direction": decision.direction,
+                     "evidence_scope": scope},
+    }
+    return proposed, assertion
+
+
+def verify_configuration_assertion(data, assertion, relation, candidate, concepts, alignments,
+                                   memberships=(), *, plan):
+    """Replay one witnessed configuration pair before creating instance edges.
+
+    A type signature alone never authorizes instance combinations. Recheck the
+    original decision's complete quotes, direction, current reference lookup,
+    and mapping kind against the exact candidate saved for that decision.
+    """
+    if (not candidate or candidate.get("status") != "endpoint_verified_candidate"
+            or candidate.get("snapshot_id") != data.snapshot_id
+            or assertion.get("configuration_candidate_id") != candidate.get("id")
+            or assertion.get("configuration_witness_record_id") != candidate.get("configuration_record_id")):
+        raise ValueError("Configuration assertion lacks its current verified candidate")
+    relation = DerivedType.model_validate(relation)
+    plan = BuildPlan.model_validate(plan)
+    if assertion.get("auxiliary_path_proof_id") or candidate.get("auxiliary_path_proof"):
+        from .auxiliary_relation_paths import replay_auxiliary_path
+        if assertion.get("auxiliary_path_proof_id") != (candidate.get("auxiliary_path_proof") or {}).get("id"):
+            raise ValueError("Configuration assertion auxiliary path proof is absent or changed")
+        replay_auxiliary_path(data, candidate, plan=plan)
+    decision = ConfigurationRelationDecision.model_validate(assertion.get("configuration_decision", {}))
+    if decision.status != "proposed" or decision.assertion_status != "affirmed" or decision.qualifier_quote:
+        raise ValueError("Configuration assertion lacks a complete affirmative decision")
+    aligned, conflicting = _type_alignments(plan, concepts, alignments, memberships)
+    endpoints = [_endpoint(data, plan, candidate, side, aligned) for side in ("source", "target")]
+    if any(endpoint[2] in conflicting for endpoint in endpoints):
+        raise ValueError("Configuration assertion endpoint bindings conflict")
+    source_type, source_match, source_record = endpoints[0]
+    target_type, target_match, target_record = endpoints[1]
+    proofs = {
+        _fragment_for_exact_record(data, source_type, source_record, decision.source_definition_quote,
+                                   source_match["evidence_ids"]),
+        _fragment_for_exact_record(data, target_type, target_record, decision.target_definition_quote,
+                                   target_match["evidence_ids"]),
+    }
+    if relation_scope_conflicts(source_type, target_type, data):
+        raise ValueError("Configuration assertion endpoint scopes conflict")
+    witness = _read_witness(data, candidate)
+    verify_configuration_pair(data, plan, candidate, witness)
+    if any(witness.get(key) != value for key, value in candidate.get("selector", {}).items()):
+        raise ValueError("Configuration assertion witness selector changed")
+    column = candidate.get("relation_text_column")
+    _check_column(data, candidate["configuration_table"], column)
+    literal = witness.get(column)
+    if (not isinstance(literal, str) or not literal.strip() or len(literal) > 1024
+            or literal != candidate.get("predicate_literal") or literal != assertion.get("configuration_text")
+            or _norm(decision.configuration_quote) != _norm(literal)
+            or decision.direction not in ("source_to_target", "target_to_source")
+            or not _explicit_direction(literal, (source_type.label, candidate.get("source_code")),
+                                      (target_type.label, candidate.get("target_code")),
+                                      decision.parent_relation, decision.direction, decision.predicate_name)):
+        raise ValueError("Configuration assertion text does not prove its complete predicate and direction")
+    config_eid = record_evidence_id(candidate["configuration_record_id"], column)
+    proof = data.evidence.get(config_eid, {})
+    ref = proof.get("source_ref", {})
+    if (proof.get("origin") != "observed_record" or proof.get("raw_fragment_truncated")
+            or proof.get("raw_fragment") != literal or ref.get("record_id") != candidate["configuration_record_id"]
+            or ref.get("snapshot_id") != data.snapshot_id or ref.get("column") != column):
+        raise ValueError("Configuration assertion lacks complete current witness evidence")
+    proofs.add(config_eid)
+    ordered = endpoints if decision.direction == "source_to_target" else endpoints[::-1]
+    (left, left_match, left_record), (right, right_match, right_record) = ordered
+    both_exact = all(value.get("mapping_kind") == "exact" for value in (left_match, right_match))
+    scope = ("one_configuration_witness_with_exact_type_alignments" if both_exact
+             else "one_configuration_witness_with_type_bindings")
+    expected_id = canonical_relation_id(decision.parent_relation, left.id, right.id,
+        predicate_name=decision.predicate_name, semantic_parameters=decision.semantic_parameters)
+    expected_subject = left_match.get("concept_id") if both_exact else left_record
+    expected_object = right_match.get("concept_id") if both_exact else right_record
+    if (relation.id != expected_id or assertion.get("predicate") != relation.id
+            or relation.parent != decision.parent_relation
+            or canonical_relation_label(relation.parent, relation.predicate_name) !=
+               canonical_relation_label(decision.parent_relation, decision.predicate_name)
+            or relation.semantic_parameters != relation_semantic_parameters(
+                decision.parent_relation, decision.predicate_name, decision.semantic_parameters)
+            or relation.domain != [left.id] or relation.range != [right.id]
+            or relation.endpoint_basis != "configuration_reference" or relation.evidence_scope != scope
+            or relation.definition != decision.definition.strip()
+            or assertion.get("subject") != expected_subject or assertion.get("object") != expected_object
+            or assertion.get("subject_type") != left.id or assertion.get("object_type") != right.id
+            or assertion.get("source_record_pair") != {"source": left_record, "target": right_record}
+            or assertion.get("endpoint_mapping_kinds") != {"source": left_match.get("mapping_kind"),
+                                                          "target": right_match.get("mapping_kind")}):
+        raise ValueError("Configuration assertion endpoint pair or predicate differs from its checked decision")
+    if decision.semantic_parameters:
+        formulas = [item["quote"] for item in _definition_previews(data, left, left_record,
+                    left_match["evidence_ids"]) if item["role"] == "formula"]
+        validate_calculation_parameter_evidence(decision.semantic_parameters, formulas, [right.label])
+    asserted = set(assertion.get("evidence_ids", []))
+    if (not proofs <= asserted or not proofs <= set(relation.evidence_ids)
+            or not asserted <= data.evidence.keys()):
+        raise ValueError("Configuration assertion omits its complete source proofs")
+
+
+def _balanced_configuration_candidates(candidates, limit):
+    """Visit each spec and semantic pattern before spending on another witness.
+
+    Scheduling never accepts the other rows in a pattern. Their exact endpoint
+    pairs and complete text remain separate candidates and in coverage.
+    """
+    specs = defaultdict(lambda: defaultdict(deque))
+    seen, seen_pairs, duplicates = set(), set(), 0
+    # A separately discovered path may use a different candidate ID for the
+    # same witness. Retain its replayable proof before deduplicating routes.
+    for item in sorted(candidates, key=lambda value: not bool(value.get("auxiliary_path_proof"))):
+        if item["id"] in seen:
+            duplicates += 1
+            continue
+        seen.add(item["id"])
+        pair = tuple(item.get(side + "_definition", {}).get("record_id") for side in ("source", "target"))
+        witness = item.get("configuration_record_id")
+        if witness and all(pair):
+            # Alternative checked join paths to the same current endpoints
+            # are proof alternatives, not fresh semantic decisions.
+            key = (witness, pair, item.get("source_type_id"), item.get("target_type_id"),
+                   item.get("relation_text_column"), item.get("predicate_literal"),
+                   item.get("direction_status"), item.get("predicate_name"),
+                   digest(item.get("semantic_parameters", {})))
+            if key in seen_pairs:
+                duplicates += 1
+                continue
+            seen_pairs.add(key)
+        literal = str(item.get("predicate_literal") or "")
+        # Code substitutions affect scheduling only; original text is retained
+        # verbatim for every decision and replay check.
+        for side in ("source", "target"):
+            code = item.get(side + "_code")
+            if isinstance(code, str) and len(code) >= 2:
+                literal = literal.replace(code, "{" + side + "_code}")
+        pattern = digest([item.get("source_type_id"), item.get("target_type_id"), literal,
+                          item.get("selector"), item.get("source_scope_bindings"),
+                          item.get("target_scope_bindings")])
+        specs[item.get("spec_id", "")][pattern].append(item)
+    queues = {}
+    for spec_id, patterns in specs.items():
+        queue = deque()
+        while any(patterns.values()):
+            for pattern in sorted(patterns):
+                if patterns[pattern]:
+                    queue.append(patterns[pattern].popleft())
+        queues[spec_id] = queue
+    selected = []
+    while len(selected) < limit and any(queues.values()):
+        for key in sorted(queues):
+            if queues[key] and len(selected) < limit:
+                selected.append(queues[key].popleft())
+    return selected, duplicates
+
+
+def _explicit_clause_candidate(candidate, plan):
+    """Route endpoint-led statements to their own predicate/qualifier checks.
+
+    This is routing, not acceptance. Negation and conditions still pass intact
+    to the explicit compiler, which can reject them; a surrounding config
+    description beginning with "this mapping" is handled as a purpose instead.
+    """
+    literal = _norm(candidate.get("predicate_literal"))
+    types = {item.id: item for item in plan.object_types}
+    anchors = []
+    for side in ("source", "target"):
+        item = types.get(candidate.get(side + "_type_id"))
+        anchors.append([_norm(value) for value in (candidate.get(side + "_code"), item.label if item else None)
+                        if value and len(_norm(value)) >= 2])
+    return any(literal.startswith(first) and second in literal[len(first):]
+               and any(_norm(cue) in literal[len(first):] for cues in _CUES.values() for cue in cues)
+               for left, right in (anchors, anchors[::-1]) for first in left for second in right)
+
+
+async def adjudicate_configuration_relations(data, profile, core, candidates,
+                                             concepts, alignments, llm, *, max_candidates=20,
+                                             checked_rules=(), memberships=()):
+    """Spend at most one model decision per candidate, retaining every failure."""
+    if type(max_candidates) is not int or max_candidates < 0:
+        raise ValueError("max_candidates must be a nonnegative integer")
+    from .llm import BudgetExceeded
+
+    selected = [item for item in candidates if item.get("status") == "endpoint_verified_candidate"]
+    chosen, duplicate_candidates = _balanced_configuration_candidates(selected, max_candidates)
+    steps, assertions, bindings = [], [], []
+    plan = BuildPlan.model_validate(core)
+    for item in chosen:
+        step = {"candidate_id": item["id"], "status": "unresolved",
+                "configuration_text": item.get("predicate_literal")}
+        try:
+            if item.get("snapshot_id") != data.snapshot_id:
+                raise ValueError("Configuration candidate snapshot differs from the input")
+            witness = _read_witness(data, item)
+            verify_configuration_pair(data, plan, item, witness)
+            if item.get("auxiliary_path_proof"):
+                from .auxiliary_relation_paths import replay_auxiliary_path
+                replay_auxiliary_path(data, item, plan=plan)
+            if any(witness.get(field) != value for field, value in item.get("selector", {}).items()):
+                raise ValueError("Configuration witness does not satisfy its condition")
+            # Structured purposes describe the config's function, independently
+            # of endpoint names. No natural-language A-depends-on-B column is needed.
+            if checked_rules and not _explicit_clause_candidate(item, plan):
+                from .semantic_bindings import (structured_configuration_purpose,
+                                                compile_structured_configuration_binding,
+                                                configuration_purpose_packet, checked_purpose_decision,
+                                                ConfigurationPurposeDecision)
+                purpose = structured_configuration_purpose(data, item, witness)
+                packet = configuration_purpose_packet(data, item, witness, plan, checked_rules)
+                if purpose is None:
+                    if packet:
+                        decision = await llm.ask("configuration_purpose", packet, ConfigurationPurposeDecision)
+                        step["llm_calls"] = 1
+                        purpose = checked_purpose_decision(packet, decision)
+                        step["purpose_decision"] = decision.model_dump()
+                        if purpose is None:
+                            step.update(status=decision.status, reason=decision.reason)
+                            steps.append(step)
+                            continue
+                    elif not item.get("relation_text_column"):
+                        raise ValueError("No eligible checked semantic reference paths; numeric overlap, "
+                                         "configuration identities or unsupported endpoint roots are not binding evidence")
+                if purpose:
+                    aligned, _ = _type_alignments(plan, concepts, alignments, memberships)
+                    plan, binding = compile_structured_configuration_binding(
+                        data, profile, plan, item, witness, purpose, checked_rules, aligned)
+                    bindings.append(binding)
+                    step.update(status="accepted", relation_type_id=binding["relation_type_id"],
+                                binding_id=binding["id"], method="checked_structured_configuration",
+                                llm_calls=step.get("llm_calls", 0))
+                    steps.append(step)
+                    continue
+            literal = item.get("predicate_literal")
+            text_column = item.get("relation_text_column")
+            if not text_column or text_column not in data.tables[item["configuration_table"]]["column_names"]:
+                raise ValueError("No explicit configuration relationship text column")
+            _check_column(data, item["configuration_table"], text_column)
+            if (not isinstance(literal, str) or not literal.strip() or len(literal) > 1024
+                    or witness[text_column] != literal):
+                raise ValueError("No bounded explicit configuration relationship text")
+            types = {value.id: value for value in plan.object_types}
+            source_type = types[item["source_type_id"]]
+            target_type = types[item["target_type_id"]]
+            aligned, _ = _type_alignments(plan, concepts, alignments, memberships)
+            _, source_match, _ = _endpoint(data, plan, item, "source", aligned)
+            _, target_match, _ = _endpoint(data, plan, item, "target", aligned)
+            payload = {
+                "candidate_id": item["id"], "configuration_text": literal,
+                "configuration_witness": item["configuration_record_id"],
+                "endpoint_a": {"type_id": source_type.id, "label": source_type.label,
+                               "definition": source_type.definition[:1024],
+                               "definition_evidence": _definition_previews(data, source_type,
+                                   item["source_definition"]["record_id"],
+                                   source_match["evidence_ids"])},
+                "endpoint_b": {"type_id": target_type.id, "label": target_type.label,
+                               "definition": target_type.definition[:1024],
+                               "definition_evidence": _definition_previews(data, target_type,
+                                   item["target_definition"]["record_id"],
+                                   target_match["evidence_ids"])},
+                "object_relation_roots": [value for value in profile["relation_roots"]
+                                          if value.get("kind") == "object"],
+                "contract": "Configuration row is a witness, never a business endpoint. "
+                            "Quote the entire statement, retaining negation, conditions and validity. "
+                            "Return unresolved for negated, conditional, expired, inactive or uncertain "
+                            "claims; only a complete positive unqualified clause can be compiled. "
+                            "Choose a registered predicate name, never free-form prose; operand roles "
+                            "must be proved by an exact formula, not inferred from endpoint order.",
+            }
+            if not payload["endpoint_a"]["definition_evidence"] or not payload["endpoint_b"]["definition_evidence"]:
+                raise ValueError("An endpoint has no complete definition evidence in the current snapshot")
+            decision = await llm.ask("configuration_relation", payload,
+                                     ConfigurationRelationDecision)
+            compiled = compile_configuration_relation(
+                data, profile, plan, item, decision, concepts, alignments, memberships=memberships)
+            if compiled:
+                plan, assertion = compiled
+                assertions.append(assertion)
+                step.update(status="accepted", relation_type_id=assertion["predicate"],
+                            assertion_id=assertion["id"])
+            else:
+                step.update(status=decision.status, reason=decision.reason)
+        except BudgetExceeded as exc:
+            step.update(status="budget_exhausted", error_type=type(exc).__name__)
+            steps.append(step)
+            break
+        except Exception as exc:
+            step.update(status="unresolved", error_type=type(exc).__name__,
+                        reason=str(exc) if isinstance(exc, ValueError) else "See trace")
+        steps.append(step)
+    not_attempted = len(selected) - len(steps)
+    errors = {}
+    for step in steps:
+        kind = step.get("error_type")
+        if kind:
+            errors[kind] = errors.get(kind, 0) + 1
+    return {"plan": plan, "assertions": assertions, "bindings": bindings, "steps": steps,
+            "coverage": {"input_candidates": len(candidates),
+                         "not_endpoint_verified": len(candidates) - len(selected),
+                         "endpoint_verified_candidates": len(selected),
+                         "selection_method": "round_robin_spec_and_semantic_pattern",
+                         "duplicate_candidate_ids": len(selected) - len({item["id"] for item in selected}),
+                         "equivalent_witness_candidates": duplicate_candidates -
+                             (len(selected) - len({item["id"] for item in selected})),
+                         "attempted": len(steps), "not_attempted": not_attempted,
+                         "accepted": sum(item["status"] == "accepted" for item in steps),
+                         "unresolved": sum(item["status"] == "unresolved" for item in steps),
+                         "budget_exhausted": sum(item["status"] == "budget_exhausted" for item in steps),
+                         "error_types": errors,
+                         "partial": bool(not_attempted or any(item["status"] in
+                                 ("unresolved", "budget_exhausted") for item in steps))}}
+
+
+def _definition_previews(data, business_type, record_id, binding_evidence=()):
+    """Read the current mapped record, not just the template's seed record.
+
+    Binding evidence can supply a different record's complete value only for
+    a definition/formula column declared by that accepted type. This does not
+    borrow text from another endpoint, snapshot or unrelated field.
+    """
+    previews = []
+    for prop in business_type.source_properties:
+        if prop.role not in ("description", "formula"):
+            continue
+        for evidence_id in sorted(set(prop.evidence_ids) | set(binding_evidence)):
+            evidence = data.evidence.get(evidence_id) or {}
+            ref = evidence.get("source_ref", {})
+            if (evidence.get("origin") == "observed_record"
+                    and not evidence.get("raw_fragment_truncated")
+                    and ref.get("snapshot_id") == data.snapshot_id
+                    and ref.get("record_id") == record_id
+                    and ref.get("table") == prop.source_table
+                    and ref.get("column") == prop.source_column):
+                value = evidence.get("raw_fragment")
+                if isinstance(value, str) and value and len(value) <= 1024:
+                    previews.append({"role": prop.role, "quote": value,
+                                     "evidence_id": evidence_id})
+    return previews

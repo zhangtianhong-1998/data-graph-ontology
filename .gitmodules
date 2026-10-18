@@ -1,0 +1,27 @@
+[submodule "route1-a-rigor"]
+	path = route1/metadata_only/code/RIGOR
+	url = https://github.com/NadeenAhmad/RIGOR.git
+[submodule "route1-b-rigor"]
+	path = route1/metadata_with_ontology/code/RIGOR
+	url = https://github.com/NadeenAhmad/RIGOR.git
+[submodule "route2-rigor"]
+	path = route2/code/RIGOR
+	url = https://github.com/NadeenAhmad/RIGOR.git
+[submodule "route2-agentscope"]
+	path = route2/code/AgentScope
+	url = https://github.com/agentscope-ai/agentscope.git
+[submodule "route3-rigor"]
+	path = route3/code/RIGOR
+	url = https://github.com/NadeenAhmad/RIGOR.git
+[submodule "route3-agentscope"]
+	path = route3/code/AgentScope
+	url = https://github.com/agentscope-ai/agentscope.git
+[submodule "route3-sand"]
+	path = route3/code/SAND
+	url = https://github.com/usc-isi-i2/sand.git
+[submodule "route3-grams"]
+	path = route3/code/GRAMS
+	url = https://github.com/usc-isi-i2/GRAMS.git
+[submodule "route3-steiner-tree"]
+	path = route3/code/steiner-tree
+	url = https://github.com/binh-vu/steiner-tree.git

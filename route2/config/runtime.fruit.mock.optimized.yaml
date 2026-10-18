@@ -1,0 +1,64 @@
+# Reproducible synthetic engineering run. Mock decisions add no business facts.
+synthetic: true
+dataset: ../local_data/fruit_smoke_v2
+data_scope: sample
+model_profile: ../ontologies/internal_model.yaml
+env_file: ../.env
+memory_limit: 2GB
+privacy: {exclude_columns: []}
+shard_size: 5000
+progress: {enabled: false}
+profiling: {sql_columns_per_group: 32}
+incremental: {mode: source_mapping_only}
+discovery:
+  enabled: true
+  value_index_mode: full_distinct
+  max_indexed_fields: 0
+  max_candidate_validations: 50
+  max_evidence_per_unit: 3
+  max_joint_pairs_per_candidate: 1
+  max_joint_example_bytes: 16000
+association_rules:
+  enabled: true
+  agent_enabled: false
+  max_rules: 60
+  max_explicit_validations: 8
+concept_recall: {enabled: false}
+alias_recall: {enabled: false}
+instance_bundles:
+  enabled: true
+  max_cards: 10000
+  max_concept_bundles: 12
+  max_relation_bundles: 12
+  max_seeds_per_table: 8
+  lexical_top_k: 8
+  max_candidates_per_bundle: 3
+  max_bundle_bytes: 16000
+  vector_enabled: false
+  max_joint_pairs_per_rule: 2
+  max_llm_bundles: 0
+  review: true
+llm:
+  mode: mock
+  responses: ../fixtures/fruit_empty_semantics_mock.yaml
+  stream: false
+  thinking: {mode: disabled, parameter: thinking, effort: medium}
+  max_calls: 100
+  max_reserved_tokens: 8000000
+  max_input_bytes: 100000
+  max_output_tokens: 8192
+  max_repairs: 0
+  max_retries: 1
+  timeout_seconds: 120
+embedding: {enabled: false, model_path: null, batch_size: 16, max_cards: 20000, core_top_k: 5, min_cosine_similarity: 0.35, query_prompt: null}
+mcp: {enabled: false}
+external: {enabled: false}
+processing:
+  materialize_all_objects: false
+  preview_objects_per_table: 2
+  max_object_records: 1200000
+  max_relation_records: 10000
+  max_text_groups: 100
+  candidate_top_k: 10
+  max_references_per_record: 100
+visualization: {enabled: true, max_nodes: 200}

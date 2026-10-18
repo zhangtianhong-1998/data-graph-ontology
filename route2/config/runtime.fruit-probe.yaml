@@ -1,0 +1,114 @@
+# 小数据语义穿刺实验。包含模型调用；生成与数据校验不会运行此配置。
+# 调用和候选均有上限，结果可能为 partial，不能视为全量准确率。
+synthetic: true
+experiment_profile: fruit_probe_10k
+dataset: ../local_data/fruit_probe_10k
+data_scope: complete_export
+model_profile: ../ontologies/internal_model.yaml
+env_file: ../.env
+memory_limit: 2GB
+privacy: {exclude_columns: []}
+shard_size: 5000
+progress: {enabled: true, min_interval_seconds: 2.0}
+profiling: {sql_columns_per_group: 32}
+stage_cache: {enabled: true}
+incremental: {mode: source_mapping_only}
+column_role_inference:
+  enabled: true
+  max_tables: 23
+  max_columns_per_table: 48
+  max_sample_rows: 8
+  max_value_chars: 512
+discovery:
+  enabled: true
+  value_index_mode: full_distinct
+  max_indexed_fields: 0
+  max_candidates_total: 3000
+  max_per_source_per_channel: 100
+  max_candidate_validations: 600
+  max_validations_per_source_table: 100
+  max_value_length: 128
+  max_fields_per_common_value: 32
+  max_condition_values_per_field: 32
+  max_conditional_pair_checks: 300
+  max_conditional_candidates: 500
+  max_condition_fields_per_table: 8
+  max_counterexamples: 5
+association_rules:
+  enabled: true
+  agent_enabled: false
+  max_rules: 2000
+  max_explicit_validations: 600
+  max_alias_validations: 8
+  max_counterexamples: 5
+alias_recall: {enabled: false}
+concept_recall: {enabled: false}
+instance_bundles:
+  enabled: true
+  max_cards: 20000
+  max_field_chars: 1024
+  max_unknown_fields_per_table: 16
+  max_concept_bundles: 24
+  max_relation_bundles: 8
+  max_pattern_seed_pool: 300
+  seed_window_index: 0
+  max_exploration_rules: 2
+  lexical_top_k: 8
+  max_candidates_per_bundle: 4
+  max_bundle_bytes: 28000
+  vector_enabled: false
+  max_joint_pairs_per_rule: 2
+  max_joined_context_records: 3
+  max_joined_context_rules: 128
+  max_joined_context_value_chars: 2048
+  max_llm_bundles: 32
+  concept_batch_size: 1
+  relation_batch_size: 4
+  max_repairs_per_bundle: 1
+  max_definition_memberships: 20000
+  review: true
+  template_projection_enabled: true
+  reserve_calls_for_followup: 8
+targeted_repair: {enabled: false}
+ontology_instantiation: {enabled: true, max_records: 20000, max_assertions: 40000}
+fact_observations: {enabled: false}
+fact_schema_induction: {enabled: false}
+fact_type_binding: {enabled: false}
+type_generalization: {enabled: false}
+type_equivalence: {enabled: false}
+configuration_relations:
+  enabled: true
+  max_specs: 8
+  max_pairs_per_spec: 10
+  max_semantic_decisions: 4
+  auxiliary_paths: false
+llm:
+  mode: agentscope
+  cache_dir: ../.cache/fruit_probe_10k_llm
+  stream: false
+  thinking: {mode: disabled, parameter: thinking, effort: medium}
+  max_calls: 128
+  max_concurrent_requests: 1
+  request_interval_seconds: 0.2
+  max_reserved_tokens: 6000000
+  max_input_bytes: 100000
+  max_output_tokens: 12288
+  max_repairs: 1
+  max_response_repairs: 1
+  max_retries: 2
+  timeout_seconds: 180
+  temperature: 0
+embedding: {enabled: false, model_path: null}
+mcp: {enabled: false}
+external: {enabled: false}
+processing:
+  materialize_all_objects: false
+  preview_objects_per_table: 3
+  max_object_records: 20000
+  # Each relation plan scans its whole source table, including rows its
+  # selector skips; 3,500 rule rows times a dozen plans exceed 40,000.
+  max_relation_records: 200000
+  max_text_groups: 100
+  candidate_top_k: 10
+  max_references_per_record: 100
+visualization: {enabled: true, max_nodes: 500}
